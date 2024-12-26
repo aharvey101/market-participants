@@ -8,10 +8,26 @@ use crossterm::{
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use serde_json::{json, Value};
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
+
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const SYMBOLS: &[&str] = &["btcusdt", "ethusdt", "bnbusdt", "xrpusdt"];
+const UPDATE_SPEED: &str = "100ms"; // Options: 100ms, 1000ms
+const DEPTH_LEVELS: u32 = 20; // Options: 5, 10, 20
+
+#[derive(Debug)]
+struct WebSocketState {
+    last_update: Instant,
+    reconnect_attempts: u32,
+    snapshot_received: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,8 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Check for user input
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') {
-                    break;
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('n') => app.next_symbol(),
+                    _ => {}
                 }
             }
         }
@@ -68,33 +86,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_websocket(tx: mpsc::Sender<Value>) -> Result<(), Box<dyn std::error::Error>> {
-    // Connect to Binance WebSocket stream API (different URL)
-    let url = Url::parse("wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms")?;
-    let (ws_stream, _) = connect_async(url).await?;
+    let mut state = WebSocketState {
+        last_update: Instant::now(),
+        reconnect_attempts: 0,
+        snapshot_received: false,
+    };
+
+    loop {
+        match connect_and_stream(&tx, &mut state).await {
+            Ok(_) => {
+                // Successful completion (probably disconnect)
+                state.reconnect_attempts = 0;
+                println!("WebSocket disconnected, attempting to reconnect...");
+            }
+            Err(e) => {
+                eprintln!("WebSocket error: {}", e);
+                state.reconnect_attempts += 1;
+            }
+        }
+
+        // Exponential backoff for reconnection
+        let delay = RECONNECT_DELAY.mul_f64(1.5f64.powi(state.reconnect_attempts as i32));
+        sleep(delay).await;
+    }
+}
+
+async fn connect_and_stream(
+    tx: &mpsc::Sender<Value>,
+    state: &mut WebSocketState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Create combined stream for multiple symbols - using regular WebSocket stream
+    let streams: Vec<String> = SYMBOLS
+        .iter()
+        .map(|&symbol| format!("{}@depth@{}", symbol, UPDATE_SPEED))
+        .collect();
+
+    // Use the regular WebSocket stream URL
+    let url = Url::parse(&format!(
+        "wss://stream.binance.com:9443/stream?streams={}",
+        streams.join("/")
+    ))?;
+
+    // Connect to WebSocket
+    let (ws_stream, _) = connect_async(&url).await?;
     let (_write, mut read) = ws_stream.split();
 
-    // Remove the interval and request logic since we're now using streams
-    loop {
-        if let Some(msg) = read.next().await {
-            match msg? {
-                Message::Text(text) => {
-                    let response: Value = serde_json::from_str(&text)?;
-                    // Stream format is different, so we need to transform it
+    // Get initial snapshots for all symbols
+    for &symbol in SYMBOLS {
+        let snapshot = fetch_initial_snapshot(symbol).await?;
+        tx.send(snapshot).await?;
+    }
+    state.snapshot_received = true;
+
+    // Process stream messages
+    while let Some(msg) = read.next().await {
+        state.last_update = Instant::now();
+
+        match msg? {
+            Message::Text(text) => {
+                let response: Value = serde_json::from_str(&text)?;
+
+                if let Some(data) = response.get("data") {
                     let transformed = json!({
-                        "result": {
-                            "bids": response["bids"],
-                            "asks": response["asks"]
-                        }
+                        "symbol": data["s"].as_str().unwrap_or("UNKNOWN").to_uppercase(),
+                        "bids": data["b"],
+                        "asks": data["a"],
+                        "lastUpdateId": data["u"]
                     });
-                    if let Some(result) = transformed.get("result") {
-                        tx.send(result.clone()).await?;
-                    }
+                    tx.send(transformed).await?;
                 }
-                Message::Close(_) => break,
-                _ => {}
             }
+            Message::Close(_) => break,
+            _ => {}
+        }
+
+        // Check for stale connection (no updates for 10 seconds)
+        if state.last_update.elapsed() > Duration::from_secs(10) {
+            return Err("Connection stale".into());
         }
     }
 
     Ok(())
+}
+
+async fn fetch_initial_snapshot(symbol: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let url = format!(
+        "https://api.binance.com/api/v3/depth?symbol={}&limit={}",
+        symbol.to_uppercase(),
+        DEPTH_LEVELS
+    );
+
+    let response = reqwest::get(&url).await?.json::<Value>().await?;
+    Ok(json!({
+        "symbol": symbol.to_uppercase(),
+        "bids": response["bids"],
+        "asks": response["asks"],
+        "lastUpdateId": response["lastUpdateId"]
+    }))
 }
