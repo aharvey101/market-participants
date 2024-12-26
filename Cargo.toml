@@ -13,3 +13,4 @@ url = "2.5"
 ratatui = "0.26.1"
 crossterm = "0.27.0"
 reqwest = { version = "0.11", features = ["json"] }
+rusqlite = { version = "0.31.0", features = ["bundled"] }

@@ -1,5 +1,6 @@
 mod ui;
 
+use binance_ws::App;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -38,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create channels for communication between WebSocket and UI
+    // Create channels for communication
     let (tx, mut rx) = mpsc::channel(32);
     let tx_clone = tx.clone();
 
@@ -50,7 +51,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Create app state
-    let mut app = ui::App::new();
+    let mut app = match App::new() {
+        Ok(app) => app,
+        Err(e) => {
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
+            terminal.show_cursor()?;
+            return Err(format!("Failed to initialize application: {}", e).into());
+        }
+    };
 
     loop {
         // Check for user input
@@ -70,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Draw UI
-        terminal.draw(|f| ui::draw(f, &app))?;
+        terminal.draw(|f| ui::draw(f, &mut app))?;
     }
 
     // Restore terminal
